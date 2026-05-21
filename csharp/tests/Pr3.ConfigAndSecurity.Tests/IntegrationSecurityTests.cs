@@ -1,6 +1,10 @@
 ﻿using System.Net;
-using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Hosting.Server;
+using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 
 namespace Pr3.ConfigAndSecurity.Tests;
@@ -10,8 +14,8 @@ public sealed class IntegrationSecurityTests
     [Fact]
     public async Task Доверенный_источник_получает_разрешающий_заголовок()
     {
-        var factory = CreateFactory(trustedOrigin: "http://localhost:5173", readLimit: 100, writeLimit: 100);
-        var client = factory.CreateClient();
+        await using var host = await StartApp(trustedOrigin: "http://localhost:5173", readLimit: 100, writeLimit: 100);
+        var client = host.Client;
 
         var request = new HttpRequestMessage(HttpMethod.Get, "/api/items");
         request.Headers.TryAddWithoutValidation("Origin", "http://localhost:5173");
@@ -26,8 +30,8 @@ public sealed class IntegrationSecurityTests
     [Fact]
     public async Task Недоверенный_источник_не_получает_разрешающий_заголовок()
     {
-        var factory = CreateFactory(trustedOrigin: "http://localhost:5173", readLimit: 100, writeLimit: 100);
-        var client = factory.CreateClient();
+        await using var host = await StartApp(trustedOrigin: "http://localhost:5173", readLimit: 100, writeLimit: 100);
+        var client = host.Client;
 
         var request = new HttpRequestMessage(HttpMethod.Get, "/api/items");
         request.Headers.TryAddWithoutValidation("Origin", "http://evil.local");
@@ -41,8 +45,8 @@ public sealed class IntegrationSecurityTests
     [Fact]
     public async Task Ограничитель_частоты_возвращает_429()
     {
-        var factory = CreateFactory(trustedOrigin: "http://localhost:5173", readLimit: 2, writeLimit: 1);
-        var client = factory.CreateClient();
+        await using var host = await StartApp(trustedOrigin: "http://localhost:5173", readLimit: 2, writeLimit: 1);
+        var client = host.Client;
 
         async Task<HttpStatusCode> Call()
         {
@@ -64,8 +68,8 @@ public sealed class IntegrationSecurityTests
     [Fact]
     public async Task Защитные_заголовки_присутствуют()
     {
-        var factory = CreateFactory(trustedOrigin: "http://localhost:5173", readLimit: 100, writeLimit: 100);
-        var client = factory.CreateClient();
+        await using var host = await StartApp(trustedOrigin: "http://localhost:5173", readLimit: 100, writeLimit: 100);
+        var client = host.Client;
 
         var response = await client.GetAsync("/api/items");
 
@@ -74,25 +78,50 @@ public sealed class IntegrationSecurityTests
         Assert.True(response.Headers.Contains("Cache-Control"));
     }
 
-    private static WebApplicationFactory<Program> CreateFactory(string trustedOrigin, int readLimit, int writeLimit)
+    private static async Task<TestHost> StartApp(string trustedOrigin, int readLimit, int writeLimit)
     {
-        return new WebApplicationFactory<Program>()
-            .WithWebHostBuilder(builder =>
-            {
-                builder.ConfigureAppConfiguration((ctx, cfg) =>
-                {
-                    cfg.Sources.Clear();
+        var settings = new Dictionary<string, string?>
+        {
+            ["App:Mode"] = "Учебный",
+            ["App:TrustedOrigins:0"] = trustedOrigin,
+            ["App:RateLimits:ReadPerMinute"] = readLimit.ToString(),
+            ["App:RateLimits:WritePerMinute"] = writeLimit.ToString()
+        };
 
-                    var settings = new Dictionary<string, string?>
-                    {
-                        ["App:Mode"] = "Учебный",
-                        ["App:TrustedOrigins:0"] = trustedOrigin,
-                        ["App:RateLimits:ReadPerMinute"] = readLimit.ToString(),
-                        ["App:RateLimits:WritePerMinute"] = writeLimit.ToString()
-                    };
+        var app = Program.BuildApp(
+            Array.Empty<string>(),
+            cfg => cfg.AddInMemoryCollection(settings),
+            webHost => webHost.UseUrls("http://127.0.0.1:0"));
 
-                    cfg.AddInMemoryCollection(settings);
-                });
-            });
+        await app.StartAsync();
+
+        var server = app.Services.GetRequiredService<IServer>();
+        var addresses = server.Features.Get<IServerAddressesFeature>();
+        var address = addresses?.Addresses.FirstOrDefault();
+
+        if (string.IsNullOrWhiteSpace(address))
+            throw new InvalidOperationException("Не удалось получить адрес тестового сервера");
+
+        var client = new HttpClient { BaseAddress = new Uri(address, UriKind.Absolute) };
+        return new TestHost(app, client);
+    }
+
+    private sealed class TestHost : IAsyncDisposable
+    {
+        private readonly WebApplication _app;
+        public HttpClient Client { get; }
+
+        public TestHost(WebApplication app, HttpClient client)
+        {
+            _app = app;
+            Client = client;
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            Client.Dispose();
+            await _app.StopAsync();
+            _app.Dispose();
+        }
     }
 }
